@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Web Audio Multi‑Output (v2, distortion‑fixed)</title>
+  <!-- Tailwind (CDN build for prototype) -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    .card { @apply bg-white/80 backdrop-blur rounded-2xl shadow-lg border border-black/5; }
+    .btn  { @apply px-4 py-2 rounded-xl shadow-sm border border-black/10 hover:shadow-md active:scale-[.99] transition; }
+    .btn-primary { @apply bg-black text-white; }
+    .btn-ghost { @apply bg-white; }
+    .btn-danger { @apply bg-red-50 text-red-700 border-red-200 hover:shadow-none; }
+    .label { @apply text-sm text-gray-600; }
+    .value { @apply font-mono text-xs text-gray-700; }
+    .hint { @apply text-[11px] text-gray-500; }
+  </style>
+</head>
+<body class="min-h-screen bg-gradient-to-br from-gray-50 to-gray-200 text-gray-900">
+  <div class="max-w-5xl mx-auto p-6 space-y-6">
+    <header class="flex items-center justify-between">
+      <h1 class="text-2xl md:text-3xl font-semibold tracking-tight">Multi‑Device Audio Fan‑Out <span class="text-gray-500 text-base">(Browser Prototype v2)</span></h1>
+      <div class="flex gap-2">
+        <button id="btnStart" class="btn btn-primary">1) Capture System/Tab Audio</button>
+        <button id="btnStop" class="btn btn-ghost" disabled>Stop Capture</button>
+      </div>
+    </header>
+
+    <section class="card p-5">
+      <div class="flex flex-wrap items-center gap-3">
+        <div class="flex items-center gap-2">
+          <span class="label">Status:</span>
+          <span id="status" class="value">idle</span>
+        </div>
+        <div class="flex items-center gap-2">
+          <span class="label">Input SR:</span>
+          <span id="inSr" class="value">–</span>
+        </div>
+        <div class="flex items-center gap-2">
+          <span class="label">Outputs:</span>
+          <span id="outCount" class="value">0</span>
+        </div>
+        <div class="ml-auto flex gap-2">
+          <button id="btnAddRoute" class="btn btn-ghost" disabled>+ Add Output</button>
+          <button id="btnStartAll" class="btn btn-primary" disabled>Play / Sync All</button>
+          <button id="btnStopAll" class="btn btn-ghost" disabled>Stop All</button>
+          <button id="btnRefresh" class="btn btn-ghost">Refresh Devices</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="grid md:grid-cols-2 gap-4" id="routes"></section>
+
+    <section class="card p-5 space-y-3">
+      <h2 class="font-semibold">What changed in v2</h2>
+      <ul class="list-disc pl-5 text-sm text-gray-700 space-y-1">
+        <li><strong>Single shared AudioContext</strong> and one <code>MediaStreamSource</code> for capture (no per‑route contexts). This removes resampler contention and eliminates most distortion.</li>
+        <li><strong>Persistent per‑route nodes</strong> (Gain → Delay → DynamicsCompressor → MediaStreamDestination). No re‑wiring on slider change → no leaks/stacking.</li>
+        <li><strong>Soft limiter</strong> via <code>DynamicsCompressorNode</code> on each route to tame peaks/clipping from codec transitions.</li>
+        <li><strong>No default output</strong>: audio is never connected to <code>ac.destination</code>, avoiding feedback/echo.</li>
+        <li>Safer start/stop and cleanup when capture ends or user stops screen share.</li>
+      </ul>
+      <p class="text-xs text-gray-500">Note: Browsers cannot enforce identical Bluetooth codec/latency across sinks; small inter‑device delays are normal. Use the per‑route delay trim to align.</p>
+    </section>
+  </div>
+
+  <template id="routeTemplate">
+    <div class="card p-4 space-y-3 route">
+      <div class="flex items-center gap-2">
+        <div class="font-medium">Output Route <span class="route-idx"></span></div>
+        <div class="text-xs text-gray-500 ml-2">sink: <span class="value route-sink">(none)</span></div>
+        <button class="btn btn-ghost ml-auto btnRemove">Remove</button>
+      </div>
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+        <div>
+          <label class="label">Audio Output Device</label>
+          <select class="w-full border rounded-xl p-2 deviceSelect"></select>
+          <div class="text-[11px] text-gray-500 mt-1">If empty: click “Refresh Devices”, or start capture first to grant permissions.</div>
+        </div>
+        <div class="grid grid-cols-3 gap-3 items-end">
+          <div>
+            <label class="label">Gain</label>
+            <input type="range" min="0" max="200" value="100" class="w-full gainRange"/>
+          </div>
+          <div>
+            <label class="label">Delay trim (ms)</label>
+            <input type="number" class="w-full border rounded-xl p-2 delayInput" value="0" step="1"/>
+          </div>
+          <div class="flex gap-2">
+            <button class="btn btn-primary btnPlay">Play</button>
+            <button class="btn btn-ghost btnPause">Pause</button>
+          </div>
+        </div>
+      </div>
+      <div class="flex items-center gap-3 text-xs text-gray-600">
+        <button class="btn btn-ghost btnClick">Test Click</button>
+        <span>Latency hint: <span class="value route-latency">BT varies</span></span>
+      </div>
+    </div>
+  </template>
+
+  <script>
+  // ===== Distortion‑fixed routing (shared AudioContext) =====
+  const state = {
+    ac: null,               // shared AudioContext
+    captureStream: null,    // getDisplayMedia stream
+    srcNode: null,          // MediaStreamSource (from capture)
+    routes: [],             // { id, mediaEl, dst, gainNode, delayNode, compNode, selNode, sinkLabelNode, playing }
+    devices: { outputs: [], ts: 0 },
+  };
+
+  const $ = (sel, root=document) => root.querySelector(sel);
+  const $$ = (sel, root=document) => Array.from(root.querySelectorAll(sel));
+  const els = {
+    status: $('#status'), inSr: $('#inSr'), outCount: $('#outCount'),
+    btnStart: $('#btnStart'), btnStop: $('#btnStop'),
+    btnAddRoute: $('#btnAddRoute'), btnStartAll: $('#btnStartAll'), btnStopAll: $('#btnStopAll'),
+    btnRefresh: $('#btnRefresh'),
+    routes: $('#routes'),
+    tpl: $('#routeTemplate')
+  };
+
+  const SECURE = window.isSecureContext;
+  const supportsSetSinkId = (obj) => typeof obj.setSinkId === 'function';
+  const setStatus = (t) => els.status.textContent = t;
+  const updateCounts = () => els.outCount.textContent = state.routes.length;
+
+  // --- Permissions helpers (unlock device labels) ---
+  async function ensureOutputDeviceAccess() {
+    try {
+      const p = await navigator.permissions?.query?.({ name: 'microphone' });
+      if (!p || p.state !== 'granted') {
+        const tmp = await navigator.mediaDevices.getUserMedia({ audio: true });
+        tmp.getTracks().forEach(t => t.stop());
+      }
+    } catch (_) { /* best effort */ }
+  }
+
+  // --- Device enumeration with light caching ---
+  async function getOutputsFresh(force=false) {
+    const now = performance.now();
+    if (!force && state.devices.outputs.length && (now - state.devices.ts < 3000)) return state.devices.outputs;
+    await ensureOutputDeviceAccess();
+    const devs = await navigator.mediaDevices.enumerateDevices();
+    const outs = devs.filter(d => d.kind === 'audiooutput');
+    state.devices.outputs = outs; state.devices.ts = now; return outs;
+  }
+
+  async function refreshDeviceSelectors(force=false) {
+    const outs = await getOutputsFresh(force);
+    for (const r of state.routes) await populateDeviceSelect(r.selNode, outs);
+  }
+
+  // --- Capture handling ---
+  async function startCapture() {
+    try {
+      if (!SECURE) setStatus('Open over HTTPS/localhost for device routing');
+      setStatus('requesting capture…');
+
+      const stream = await navigator.mediaDevices.getDisplayMedia({
+        video: true,
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+      });
+      // Disable video to save resources
+      stream.getVideoTracks().forEach(t => t.enabled = false);
+
+      // Build shared context/graph
+      const ac = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
+      const src = ac.createMediaStreamSource(stream);
+
+      state.ac = ac;
+      state.captureStream = stream;
+      state.srcNode = src;
+
+      els.inSr.textContent = ac.sampleRate + ' Hz';
+
+      // If user stops sharing, clean up
+      stream.getTracks().forEach(tr => tr.addEventListener('ended', stopCapture));
+
+      els.btnStop.disabled = false;
+      els.btnAddRoute.disabled = false;
+      els.btnStartAll.disabled = false;
+      els.btnStopAll.disabled = false;
+      setStatus('capturing');
+
+      await refreshDeviceSelectors(true);
+    } catch (e) {
+      console.error(e); setStatus('capture failed: ' + e.message);
+    }
+  }
+
+  async function stopCapture() {
+    try {
+      state.captureStream?.getTracks().forEach(t => t.stop());
+    } catch {}
+    try { await state.ac?.close(); } catch {}
+    state.ac = null; state.captureStream = null; state.srcNode = null;
+    els.inSr.textContent = '–'; setStatus('idle');
+  }
+
+  // --- Route lifecycle ---
+  async function createRoute() {
+    const id = 'r' + Math.random().toString(36).slice(2, 8);
+
+    const node = els.tpl.content.firstElementChild.cloneNode(true);
+    node.dataset.id = id;
+    node.querySelector('.route-idx').textContent = String(state.routes.length + 1);
+    node.querySelector('.route-sink').textContent = '(select device)';
+
+    // HTMLMediaElement sink per route
+    const mediaEl = document.createElement('audio');
+    mediaEl.autoplay = false; mediaEl.playsInline = true; mediaEl.muted = false;
+
+    const sel = node.querySelector('.deviceSelect');
+    const btnPlay = node.querySelector('.btnPlay');
+    const btnPause = node.querySelector('.btnPause');
+    const btnRemove = node.querySelector('.btnRemove');
+    const gainRange = node.querySelector('.gainRange');
+    const delayInput = node.querySelector('.delayInput');
+    const sinkLabelNode = node.querySelector('.route-sink');
+
+    // Create persistent nodes for this route (but only once capture exists)
+    let dst = null, gainNode = null, delayNode = null, compNode = null;
+
+    function ensureChain() {
+      if (!state.ac || !state.srcNode) return;
+      if (dst) return; // already built
+      dst = state.ac.createMediaStreamDestination();
+
+      // Build per‑route processing chain
+      gainNode = state.ac.createGain();
+      gainNode.gain.value = Number(gainRange.value) / 100;
+
+      delayNode = state.ac.createDelay(2.0);
+      delayNode.delayTime.value = Number(delayInput.value) / 1000;
+
+      // Gentle limiter to avoid clipping in route/device codec
+      compNode = state.ac.createDynamicsCompressor();
+      compNode.threshold.value = -12; // dB
+      compNode.knee.value = 20;
+      compNode.ratio.value = 3;
+      compNode.attack.value = 0.003;
+      compNode.release.value = 0.25;
+
+      // Fan‑out from the single source into this route
+      state.srcNode.connect(gainNode).connect(delayNode).connect(compNode).connect(dst);
+
+      mediaEl.srcObject = dst.stream;
+    }
+
+    // Live param updates (no re‑wiring)
+    gainRange.addEventListener('input', () => {
+      if (gainNode) gainNode.gain.value = Number(gainRange.value) / 100;
+    }, { passive: true });
+
+    delayInput.addEventListener('change', () => {
+      if (delayNode) delayNode.delayTime.value = Number(delayInput.value) / 1000;
+    });
+
+    btnPlay.addEventListener('click', async () => {
+      try {
+        ensureChain();
+        await state.ac?.resume();
+        await mediaEl.play();
+      } catch (e) { console.warn('play error', e); }
+    });
+
+    btnPause.addEventListener('click', async () => {
+      try { mediaEl.pause(); } catch {}
+      // Do not suspend the shared context here; other routes may be playing
+    });
+
+    btnRemove.addEventListener('click', () => removeRoute(id));
+
+    // Test click -> route‑local short tone
+    node.querySelector('.btnClick').addEventListener('click', () => {
+      if (!state.ac) return;
+      const osc = state.ac.createOscillator();
+      const g = state.ac.createGain();
+      g.gain.setValueAtTime(0, state.ac.currentTime);
+      g.gain.linearRampToValueAtTime(0.6, state.ac.currentTime + 0.002);
+      g.gain.exponentialRampToValueAtTime(0.0001, state.ac.currentTime + 0.08);
+      osc.frequency.value = 1200;
+      const localDst = state.ac.createMediaStreamDestination();
+      osc.connect(g).connect(localDst);
+      const mixEl = new Audio(); mixEl.srcObject = localDst.stream; mixEl.play().catch(()=>{});
+      osc.start(); osc.stop(state.ac.currentTime + 0.12);
+    });
+
+    els.routes.appendChild(node);
+
+    const route = { id, mediaEl, dst, gainNode, delayNode, compNode, selNode: sel, sinkLabelNode };
+    state.routes.push(route);
+    updateCounts();
+
+    await populateDeviceSelect(sel);
+
+    sel.addEventListener('change', async () => {
+      const sinkId = sel.value;
+      if (!sinkId || !supportsSetSinkId(mediaEl)) return;
+      try {
+        await mediaEl.setSinkId(sinkId);
+        const opt = sel.options[sel.selectedIndex];
+        sinkLabelNode.textContent = opt.textContent || '(device)';
+      } catch (e) {
+        console.error('setSinkId failed', e);
+        sinkLabelNode.textContent = 'setSinkId failed';
+      }
+    });
+  }
+
+  async function removeRoute(id) {
+    const idx = state.routes.findIndex(r => r.id === id);
+    if (idx === -1) return;
+    const r = state.routes[idx];
+    try { r.mediaEl.pause(); } catch {}
+    // Disconnect nodes if present
+    try { r.compNode?.disconnect(); } catch {}
+    try { r.delayNode?.disconnect(); } catch {}
+    try { r.gainNode?.disconnect(); } catch {}
+    state.routes.splice(idx, 1);
+    const card = els.routes.querySelector(`[data-id="${id}"]`);
+    if (card) card.remove();
+    $$('.route-idx', els.routes).forEach((n, i) => n.textContent = String(i+1));
+    updateCounts();
+  }
+
+  async function populateDeviceSelect(sel, outs=null) {
+    try {
+      outs = outs && outs.length ? outs : await getOutputsFresh();
+      sel.innerHTML = '';
+      const placeholder = document.createElement('option');
+      placeholder.textContent = outs.length ? '-- choose output device --' : 'No audio outputs found';
+      placeholder.value = '';
+      sel.appendChild(placeholder);
+      outs.forEach(d => {
+        const o = document.createElement('option');
+        o.value = d.deviceId;
+        const label = (d.label && d.label.trim()) ? d.label : `Audio output (${d.deviceId.slice(0,6)}…)`;
+        o.textContent = label;
+        sel.appendChild(o);
+      });
+    } catch (e) { console.error('populateDeviceSelect error', e); }
+  }
+
+  async function playAll() {
+    try { await state.ac?.resume(); } catch {}
+    const plays = state.routes.map(async r => {
+      try { await r.mediaEl.play(); } catch (e) { console.warn('play err', e); }
+    });
+    await Promise.allSettled(plays);
+  }
+
+  function stopAll() {
+    for (const r of state.routes) {
+      try { r.mediaEl.pause(); } catch {}
+    }
+  }
+
+  // --- Event bindings ---
+  els.btnStart.addEventListener('click', startCapture);
+  els.btnStop.addEventListener('click', stopCapture);
+  els.btnAddRoute.addEventListener('click', createRoute);
+  els.btnStartAll.addEventListener('click', playAll);
+  els.btnStopAll.addEventListener('click', stopAll);
+  els.btnRefresh.addEventListener('click', () => refreshDeviceSelectors(true));
+
+  navigator.mediaDevices?.addEventListener?.('devicechange', () => refreshDeviceSelectors(true));
+
+  if (!('setSinkId' in HTMLMediaElement.prototype)) {
+    setStatus('Warning: setSinkId() not supported in this browser');
+  }
+  </script>
+</body>
+</html>
