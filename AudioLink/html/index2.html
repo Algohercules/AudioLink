@@ -6,7 +6,8 @@
   <title>Multi-Device Audio Router v5 (Safe + Low-Latency)</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <style>
-    .vu-bar { height: 6px; border-radius: 4px;
+    .vu-bar {
+      height: 6px; border-radius: 4px;
       background: linear-gradient(to right, #22c55e, #facc15, #ef4444);
       transition: width 60ms linear;
     }
@@ -14,7 +15,7 @@
 </head>
 <body class="bg-gray-900 text-white min-h-screen p-6">
   <div class="max-w-5xl mx-auto space-y-6">
-    <h1 class="text-3xl font-bold text-center">🎛️ Multi-Device Audio Router v5</h1>
+    <h1 class="text-3xl font-bold text-center">🎛 Multi-Device Audio Router v5</h1>
 
     <!-- Global Controls -->
     <div class="flex flex-wrap justify-center gap-3">
@@ -42,15 +43,15 @@ let srcNode = null;
 let stream = null;
 let devices = [];
 const routes = [];
-const defaultGuard = true; // prevent echo on default sink
+const defaultGuard = true; // prevent echo on default/system sink
 
 const infoEl = document.getElementById('info');
 const warnEl = document.getElementById('warn');
 
+function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+
 /* =========================
    AudioWorklet: Limiter + Meter
-   - Soft clipper + lookahead limiter (very light)
-   - RMS meter via postMessage
 ========================= */
 const workletCode = `
 class LimiterProcessor extends AudioWorkletProcessor {
@@ -66,11 +67,9 @@ class LimiterProcessor extends AudioWorkletProcessor {
     this._rmsAccum = 0;
     this._rmsCount = 0;
     this._lastGain = 1.0;
-    this._meterInterval = 128; // frames per estimate
+    this._meterInterval = 128;
     this._framesSincePost = 0;
   }
-
-  // simple soft-knee limiter
   process(inputs, outputs, parameters) {
     const input = inputs[0];
     const output = outputs[0];
@@ -87,21 +86,18 @@ class LimiterProcessor extends AudioWorkletProcessor {
       for (let i = 0; i < inp.length; i++) {
         let s = inp[i] * preGain;
 
-        // soft clipper (tanh-ish)
         const abs = Math.abs(s);
         if (abs > threshold) {
           const over = abs - threshold;
-          s = Math.sign(s) * (threshold + over / (1 + over * 8)); // gentle knee
+          s = Math.sign(s) * (threshold + over / (1 + over * 8));
         }
 
-        // very light release smoothing to avoid pumping
         const g = Math.min(1, threshold / Math.max(threshold, Math.abs(s)));
         this._lastGain = this._lastGain + (g - this._lastGain) * rel;
         const y = s * this._lastGain;
 
         out[i] = y;
 
-        // meter (rms)
         this._rmsAccum += y * y;
         this._rmsCount++;
 
@@ -122,7 +118,6 @@ registerProcessor('limiter-processor', LimiterProcessor);
 
 async function ensureWorkletLoaded() {
   if (!ac) return;
-  // load once per context
   if (!ac._limiterLoaded) {
     const blob = new Blob([workletCode], { type: 'application/javascript' });
     const url = URL.createObjectURL(blob);
@@ -142,7 +137,6 @@ async function refreshDevices() {
     warnEl.textContent = noLabels
       ? 'Tip: To show device names, grant microphone permission once (labels are hidden otherwise).'
       : '';
-    // update all selects
     document.querySelectorAll('.deviceSelect').forEach(sel => {
       const current = sel.value;
       sel.innerHTML = '';
@@ -152,7 +146,6 @@ async function refreshDevices() {
         opt.textContent = d.label || `Device ${d.deviceId}`;
         sel.appendChild(opt);
       }
-      // restore previous choice if present
       if ([...sel.options].some(o => o.value === current)) sel.value = current;
     });
   } catch (e) {
@@ -160,7 +153,6 @@ async function refreshDevices() {
     warnEl.textContent = 'Failed to enumerate audio outputs. Use a Chromium-based browser and a secure context (https).';
   }
 }
-
 
 navigator.mediaDevices?.addEventListener('devicechange', refreshDevices);
 
@@ -181,10 +173,10 @@ async function startCapture() {
     return;
   }
 
-  // Stop captured video immediately to reduce overhead
+  // Stop video to reduce overhead
   stream.getVideoTracks().forEach(t => t.stop());
 
-  // Create a fresh low-latency context
+  // Fresh low-latency context
   ac = new (window.AudioContext || window.webkitAudioContext)({
     latencyHint: 'interactive',
     sampleRate: 48000
@@ -194,14 +186,13 @@ async function startCapture() {
 
   srcNode = ac.createMediaStreamSource(stream);
 
-  infoEl.textContent = `Capturing @ ${ac.sampleRate} Hz • Output latency: ${Math.round(ac.outputLatency * 1000)} ms`;
+  infoEl.textContent = `Capturing @ ${ac.sampleRate} Hz • Output latency: ${Math.round((ac.outputLatency || 0) * 1000)} ms`;
 
   // Nudge autoplay policies
   try { await ac.resume(); } catch {}
 
-  // Improve device labels after user gesture
+  // One-shot mic permission to unlock labels
   try {
-    // quick one-shot mic permission to unlock labels (no actual use)
     const mic = await navigator.mediaDevices.getUserMedia({ audio: true });
     mic.getTracks().forEach(t => t.stop());
   } catch {}
@@ -220,10 +211,12 @@ function stopCapture() {
   // stop all routes and disconnect
   routes.splice(0).forEach(r => {
     try { r.audioEl.pause(); } catch {}
-    try { r.g.disconnect(); r.d.disconnect(); r.lim.disconnect(); } catch {}
+    try { r.lim.disconnect(); } catch {}
+    try { r.hp.disconnect(); } catch {}
+    try { r.d.disconnect(); } catch {}
+    try { r.g.disconnect(); } catch {}
   });
 
-  // close context for real cleanup
   if (ac) {
     const ctx = ac;
     ac = null;
@@ -231,6 +224,36 @@ function stopCapture() {
   }
 
   infoEl.textContent = 'Capture stopped.';
+}
+
+/* =========================
+   Helpers for sinks & play
+========================= */
+async function bindSink(audioEl, deviceId, allowDefault) {
+  if (!audioEl.setSinkId) {
+    alert('setSinkId is not supported in this browser (try Chromium-based).');
+    throw new Error('No setSinkId');
+  }
+  if (!allowDefault && defaultGuard && (deviceId === 'default' || deviceId === '')) {
+    throw new Error('Default sink guarded');
+  }
+  await audioEl.setSinkId(deviceId);
+}
+
+async function robustPlay(audioEl) {
+  // Prime muted to satisfy autoplay, then unmute
+  audioEl.muted = true;
+  try {
+    await audioEl.play();
+  } catch (e) {
+    // Try resume context and retry once
+    try { await ac?.resume(); } catch {}
+    await sleep(10);
+    await audioEl.play();
+  }
+  // small delay to allow device ramp-up, then unmute
+  await sleep(50);
+  audioEl.muted = false;
 }
 
 /* =========================
@@ -245,7 +268,7 @@ async function createRoute() {
   const g = ac.createGain();
   const d = ac.createDelay(2.0);
 
-  // High-pass filter to reduce rumble/low-frequency build-up
+  // High-pass filter to reduce low rumble
   const hp = ac.createBiquadFilter();
   hp.type = 'highpass';
   hp.frequency.value = 40;
@@ -265,13 +288,17 @@ async function createRoute() {
 
   // audio element sink
   const audioEl = new Audio();
-  audioEl.srcObject = dst.stream;
+  // give each element its own stream object (avoid shared refs)
+  const track = dst.stream.getAudioTracks()[0];
+  audioEl.srcObject = new MediaStream([track]);
   audioEl.loop = true;
   audioEl.autoplay = false;
-  audioEl.playsInline = true; // iOS
+  audioEl.playsInline = true;
+  audioEl.preload = 'auto';
+  audioEl.crossOrigin = 'anonymous';
 
   // UI card
-  const id = Date.now();
+  const id = Date.now() + Math.random();
   const wrapper = document.createElement('div');
   wrapper.className = 'p-4 rounded-2xl bg-gray-800 shadow-xl space-y-3';
   wrapper.id = `route-${id}`;
@@ -326,26 +353,21 @@ async function createRoute() {
     select.appendChild(opt);
   }
 
+  // Prefer a non-default to avoid echo by default
+  if (select.options.length > 0) {
+    const firstNonDefault = [...select.options].find(o => o.value !== 'default' && o.value !== '');
+    select.value = firstNonDefault ? firstNonDefault.value : select.options[0].value;
+  }
+
   // Device change handler with guard
   select.onchange = async () => {
     const allowDefault = wrapper.querySelector('.allowDefault').checked;
     const sel = select.value;
-
-    if (!audioEl.setSinkId) {
-      alert('setSinkId is not supported in this browser.');
-      return;
-    }
-
-    if (!allowDefault && defaultGuard && (sel === 'default' || sel === '' )) {
-      alert('Default/system sink is guarded to avoid echo. Tick the checkbox to override.');
-      return;
-    }
-
     try {
-      await audioEl.setSinkId(sel);
+      await bindSink(audioEl, sel, allowDefault);
     } catch (e) {
       console.error('setSinkId failed:', e);
-      alert('Could not switch output to the selected device. It may be blocked by the browser.');
+      alert('Could not switch output to the selected device. It may be blocked by the browser or guarded.');
     }
   };
 
@@ -358,18 +380,15 @@ async function createRoute() {
   wrapper.querySelector('.hipassInput').oninput = e => hp.frequency.value = Math.min(200, Math.max(20, Number(e.target.value)||40));
 
   wrapper.querySelector('.play').onclick = async () => {
-    try {
-      await audioEl.play();
-    } catch (e) {
-      console.error(e);
-      alert('Autoplay blocked. Click again after interacting with the page.');
-    }
+    try { await robustPlay(audioEl); } catch (e) { console.error(e); alert('Autoplay blocked. Click again after interacting with the page.'); }
   };
   wrapper.querySelector('.pause').onclick = () => audioEl.pause();
   wrapper.querySelector('.remove').onclick = () => {
     try { audioEl.pause(); } catch {}
     try { limiter.disconnect(); } catch {}
-    try { hp.disconnect(); g.disconnect(); d.disconnect(); } catch {}
+    try { hp.disconnect(); } catch {}
+    try { g.disconnect(); } catch {}
+    try { d.disconnect(); } catch {}
     wrapper.remove();
     const idx = routes.findIndex(r => r.id === id);
     if (idx >= 0) routes.splice(idx, 1);
@@ -379,20 +398,16 @@ async function createRoute() {
   const bar = wrapper.querySelector('.vu-bar');
   limiter.port.onmessage = (ev) => {
     const rms = ev.data?.rms ?? 0;
-    // Convert RMS to a UI-friendly 0..100
     const pct = Math.min(100, Math.max(0, Math.sqrt(rms) * 150));
     bar.style.width = pct + '%';
   };
 
   // Add to registry
-  routes.push({ id, g, d, hp, lim: limiter, dst, audioEl });
+  routes.push({ id, g, d, hp, lim: limiter, dst, audioEl, select });
 
-  // Try initial sink select (if there is a non-default device)
-  if (select.options.length > 0) {
-    // Prefer a non-default device to avoid echo by default
-    const firstNonDefault = [...select.options].find(o => o.value !== 'default' && o.value !== '');
-    select.value = firstNonDefault ? firstNonDefault.value : select.options[0].value;
-    await select.onchange();
+  // Bind the initial sink and keep paused until user presses play
+  if (select.value) {
+    try { await bindSink(audioEl, select.value, wrapper.querySelector('.allowDefault').checked); } catch {}
   }
 }
 
@@ -402,9 +417,21 @@ async function createRoute() {
 document.getElementById('startCapture').onclick = startCapture;
 document.getElementById('stopCapture').onclick  = stopCapture;
 document.getElementById('addRoute').onclick     = createRoute;
+
 document.getElementById('playAll').onclick      = async () => {
-  for (const r of routes) { try { await r.audioEl.play(); } catch {} }
+  // Ensure each route is bound to its sink first
+  for (const r of routes) {
+    try {
+      await bindSink(r.audioEl, r.select.value, r.select.closest('div').querySelector('.allowDefault').checked);
+    } catch (e) { console.warn('Sink bind skipped for a route:', e); }
+  }
+  // Play sequentially to satisfy autoplay policies & device ramp-up
+  for (const r of routes) {
+    try { await robustPlay(r.audioEl); } catch (e) { console.error('Play failed for a route', e); }
+    await sleep(40); // tiny stagger reduces contention
+  }
 };
+
 document.getElementById('stopAll').onclick      = () => routes.forEach(r => { try { r.audioEl.pause(); } catch {} });
 document.getElementById('refreshDevices').onclick = refreshDevices;
 
